@@ -1,4 +1,8 @@
 
+/** Toto rozsirenie sluzi na sifrovanie a desifrovanie obrazu v programe Total Commander v 32 bitovej verzii.
+*	Autor: Mario Majernik
+*/
+
 #include "stdafx.h"
 #include "wcxhead.h"
 #include <stdio.h>
@@ -80,7 +84,7 @@ void SHA256hashing(unsigned char * keyStr, int size, AES_KEY *key_hash) {
 	SHA256_Init(&sha_key);
 	SHA256_Update(&sha_key, keyStr, size);
 	SHA256_Final(hash_key, &sha_key);
-	AES_set_encrypt_key(hash_key, 256, key_hash);
+	AES_set_encrypt_key(hash_key, size*8, key_hash);
 }
 
 int loadKey(unsigned char* key, char* keyFile, int size) {
@@ -161,7 +165,7 @@ void setInitialVector(char * nameOfIV, unsigned char * initialVector, int sector
 	}
 }
 
-int cbcEncryption(HANDLE inputFile, HANDLE output, unsigned char* keyStr, char enc, char *iv, int sizeFrom, int sizeTo) {
+int cbcEncryption(HANDLE inputFile, HANDLE output, unsigned char* keyStr, int keySize, char enc, char *iv, int sizeFrom, int sizeTo) {
 	unsigned char *block = (unsigned char*)malloc(SECTOR_SIZE);
 	unsigned char *out_block = (unsigned char*)malloc(SECTOR_SIZE);
 	unsigned char* initialVector;
@@ -179,14 +183,14 @@ int cbcEncryption(HANDLE inputFile, HANDLE output, unsigned char* keyStr, char e
 	AES_KEY key_hash;
 
 	if (enc == 'e') {
-		AES_set_encrypt_key(keyStr, 256, &key);
+		AES_set_encrypt_key(keyStr, keySize*8, &key);
 	}
 	if (enc == 'd') {
-		AES_set_decrypt_key(keyStr, 256, &key);
+		AES_set_decrypt_key(keyStr, keySize * 8, &key);
 	}
 
 	if (strcmp(iv, "essiv") == 0) {
-		SHA256hashing(keyStr, 2 * BLOCK_SIZE, &key_hash);
+		SHA256hashing(keyStr, keySize, &key_hash);
 	}
 	int benbi_shift=0;
 	if (strcmp(iv, "benbi") == 0) {
@@ -227,7 +231,7 @@ int cbcEncryption(HANDLE inputFile, HANDLE output, unsigned char* keyStr, char e
 	return 0;
 }
 
-int xtsEncryption(HANDLE inputFile, HANDLE output, unsigned char* keyStr, char enc, char *iv, int sizeFrom, int sizeTo) {
+int xtsEncryption(HANDLE inputFile, HANDLE output, unsigned char* keyStr, int keySize, char enc, char *iv, int sizeFrom, int sizeTo) {
 	unsigned char *block = (unsigned char*)malloc(SECTOR_SIZE);
 	unsigned char *out_block = (unsigned char*)malloc(SECTOR_SIZE);
 	unsigned char* initialVector;
@@ -243,7 +247,7 @@ int xtsEncryption(HANDLE inputFile, HANDLE output, unsigned char* keyStr, char e
 
 	AES_KEY key_hash;
 	if (strcmp(iv, "essiv") == 0) {
-		SHA256hashing(keyStr, 2 * BLOCK_SIZE, &key_hash);
+		SHA256hashing(keyStr, keySize, &key_hash);
 	}
 
 	int benbi_shift=0;
@@ -272,12 +276,22 @@ int xtsEncryption(HANDLE inputFile, HANDLE output, unsigned char* keyStr, char e
 
 		setInitialVector(iv, initialVector, sector, &key_hash, benbi_shift);
 		if (enc == 'e') {
-			EVP_EncryptInit(ctx, EVP_aes_128_xts(), keyStr, initialVector);
+			if (keySize == 32) {
+				EVP_EncryptInit(ctx, EVP_aes_128_xts(), keyStr, initialVector);
+			}
+			else {
+				EVP_EncryptInit(ctx, EVP_aes_256_xts(), keyStr, initialVector);
+			}
 			EVP_EncryptUpdate(ctx, out_block, &len, block, SECTOR_SIZE);
 			EVP_EncryptFinal(ctx, out_block + len, &len);
 		}
 		else if (enc == 'd') {
-			EVP_DecryptInit(ctx, EVP_aes_128_xts(), keyStr, initialVector);
+			if (keySize == 32) {
+				EVP_DecryptInit(ctx, EVP_aes_128_xts(), keyStr, initialVector);
+			}
+			else {
+				EVP_DecryptInit(ctx, EVP_aes_256_xts(), keyStr, initialVector);
+			}
 			EVP_DecryptUpdate(ctx, out_block, &len, block, SECTOR_SIZE);
 			EVP_DecryptFinal(ctx, out_block + len, &len);
 		}
@@ -371,11 +385,29 @@ int __stdcall ReadHeader(myHANDLE hArcData, tHeaderData *HeaderData)
 		return E_BAD_DATA;
 	}
 	
-	unsigned char key[2 * BLOCK_SIZE];
-	int checkKey = loadKey(key, keyPath, 2 * BLOCK_SIZE);
+	FILE * file_key = fopen(keyPath, "rb");	
+	fseek(file_key, 0, SEEK_END);
+	const int fileSize = ftell(file_key);
+	rewind(file_key);
+	if (fileSize != 16 && fileSize != 32 && fileSize != 64) {
+		fprintf(errorFile, "Velkost kluca je nespravna. Kluc musi mat velkost 16, 32 alebo bytov\n");
+		fclose(errorFile);
+		return E_BAD_DATA;
+	}
+	fclose(file_key);
+
+	if ((strcmp(mode, "cbc") == 0 && fileSize == 64) || (strcmp(mode, "xts") == 0 && fileSize == 16)) {		
+		fprintf(errorFile, "Pozadovany mod nepodporuje terajsiu velkost kluca \n");
+		fclose(errorFile);
+		return E_BAD_DATA;
+	}
+
+	unsigned char *key= (unsigned char*)malloc(fileSize);
+	int checkKey = loadKey(key, keyPath, fileSize);
 	
 	if ( checkKey != 0 ) {
 		fprintf(errorFile, "Kluc sa nenacital spravne\n");	
+		free(key);
 		fclose(errorFile);
 		return checkKey;
 	}
@@ -383,22 +415,25 @@ int __stdcall ReadHeader(myHANDLE hArcData, tHeaderData *HeaderData)
 
 	if (file == INVALID_HANDLE_VALUE) {
 		fprintf(errorFile, "Novy subor sa nevytvoril\n");
+		free(key);
 		fclose(errorFile);
 		return E_ECREATE;
 	}
 
 	if (strcmp(mode, "cbc") == 0) {		
-		int check = cbcEncryption(arch->hArchFile, file, key, encryption, vector, from, to);
+		int check = cbcEncryption(arch->hArchFile, file,  key, fileSize, encryption, vector, from, to);
 		if ( check != 0 ) {
 			fprintf(errorFile, "Chyba pri sifrovani/desifrovani\n");
+			free(key);
 			fclose(errorFile);
 			return check;
 		}
 	}
 	if (strcmp(mode, "xts") == 0) {
-		int check = xtsEncryption(arch->hArchFile, file, key, encryption, vector, from, to);
+		int check = xtsEncryption(arch->hArchFile, file, key, fileSize, encryption, vector, from, to);
 		if ( check != 0 ) {
 			fprintf(errorFile, "Chyba pri sifrovani/desifrovani\n");
+			free(key);
 			fclose(errorFile);
 			return check;
 		}
@@ -417,6 +452,7 @@ int __stdcall ReadHeader(myHANDLE hArcData, tHeaderData *HeaderData)
 	HeaderData->Method = 0;
 	HeaderData->FileCRC = 0;
 	CloseHandle(file);
+	free(key);
 	fclose(errorFile);
 	return E_END_ARCHIVE;
 }
